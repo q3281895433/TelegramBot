@@ -1,0 +1,680 @@
+"""
+botmain.py
+==========
+通用工具类 Telegram 机器人主程序（v2：免费查询 / 付费查询 分开两套面板）。
+
+要点：
+  1. 只有 /start 一个斜杠命令，其余全部走 inline 按钮回调，
+     业务逻辑只有一条路径，不存在"命令扣分、按钮不扣分"的不一致。
+  2. 积分制度只服务于"付费查询"：FREE_MODULES 里的工具永远不会扣分，
+     只有 PAID_MODULES 才检查/扣除 db.points。
+  3. 充值目前只支持 USDT（链上自动核账），汇率 1 USDT = config.USDT_TO_POINTS 积分（默认 7）。
+     【2026-08-17 变更】OKPay 自动下单入口已下线（对接一直有问题），
+     充值面板里 OKPay 按钮改为引导联系管理员 @SZAD1246 人工处理，
+     不再调用 payment.create_okpay_order。payment.py 里的 OKPay 相关函数
+     仍然保留，如果以后要重新接通，恢复 pay_home_panel / _create_order_with_amount
+     里被删掉的分支即可。
+  4. 邀请：每个用户有专属邀请码，通过 /start <邀请码> 建立邀请关系，
+     邀请人按 config.INVITE_REWARD_POINTS 获得积分奖励。
+  5. 管理员面板：用户列表（加/扣积分、封禁/解封）、收款地址池管理、广播消息。
+     只有 config.ADMIN_IDS 里的人能看到"管理面板"按钮。
+  6. 每次响应尽量编辑同一条面板消息来切换界面（ui.render），减少重复发送。
+"""
+
+import logging
+import threading
+import time
+
+import telebot
+from telebot import types
+
+import config
+import db
+import payment
+import ui
+from logger import log_action
+from modules import FREE_MODULES, PAID_MODULES, get_module
+
+# ---------------------------------------------------------
+# 初始化
+# ---------------------------------------------------------
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+bot = telebot.TeleBot(config.BOT_TOKEN)
+if config.PROXY:
+    telebot.apihelper.proxy = config.PROXY
+
+# 给所有 Telegram API 请求设上限：连接 15 秒、读取 20 秒超时，
+# 代理卡住时能自动放弃重连，而不是无限期挂起（这是之前"卡住"的根源）。
+telebot.apihelper.CONNECT_TIMEOUT = 15
+telebot.apihelper.READ_TIMEOUT = 20
+
+db.init_db()
+payment.init_addresses()
+bot.set_my_commands([types.BotCommand("start", "打开面板")])
+
+try:
+    BOT_USERNAME = bot.get_me().username
+except Exception:
+    BOT_USERNAME = ""
+
+# 管理员联系方式（OKPay 人工充值等场景使用）
+ADMIN_CONTACT_USERNAME = "SZAD1246"
+ADMIN_CONTACT_URL = f"https://t.me/{ADMIN_CONTACT_USERNAME}"
+
+# ---------------------------------------------------------
+# 运行时状态
+# ---------------------------------------------------------
+
+PANEL = {}      # user_id -> {"chat_id":, "message_id":}   当前面板消息位置
+WAITING = {}    # user_id -> dict                          等待下一条文本输入的上下文
+ADDR_SHORT = {}  # 地址短码 -> 真实地址（管理端地址池按钮用）
+
+
+def _panel_ref(user_id):
+    ref = PANEL.get(user_id)
+    return (ref["chat_id"], ref["message_id"]) if ref else (None, None)
+
+
+def _show(chat_id, user_id, text, markup):
+    message_id = _panel_ref(user_id)[1]
+    new_id = ui.render(bot, chat_id, message_id, text, markup)
+    PANEL[user_id] = {"chat_id": chat_id, "message_id": new_id}
+
+
+def is_admin(user_id):
+    return config.is_admin(user_id)
+
+
+def blocked(user_id, chat_id):
+    if db.is_banned(user_id):
+        user = db.get_user(user_id)
+        reason = user["ban_reason"] if user else "管理员封禁"
+        bot.send_message(chat_id, f"🚫 你的账号已被封禁。\n原因：{reason}")
+        return True
+    return False
+
+
+# ---------------------------------------------------------
+# 面板：主菜单
+# ---------------------------------------------------------
+
+def main_menu_panel(user_id):
+    user = db.get_or_create_user(user_id, None)
+    text = (
+        ui.header("主菜单", "🔷")
+        + f"\n💎 付费积分：<b>{user['points']}</b>\n"
+        + ui.divider()
+    )
+    rows = [
+        [("🆓 免费查询", "free:home"), ("💎 付费查询", "paid:home")],
+        [("💰 充值", "pay:home"), ("🎁 邀请好友", "invite:home")],
+    ]
+    if is_admin(user_id):
+        rows.append([("🛠 管理面板", "admin:home")])
+    return text, ui.kb(rows)
+
+
+def free_home_panel():
+    text = ui.header("免费查询", "🆓") + "\n以下工具完全免费，不消耗积分：\n" + ui.divider()
+    rows = []
+    row = []
+    for key, mod in FREE_MODULES.items():
+        row.append((f"{mod['emoji']} {mod['title']}", f"tool:free:{key}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([("⬅️ 返回主菜单", "menu:main")])
+    return text, ui.kb(rows)
+
+
+def paid_home_panel(user_id):
+    user = db.get_user(user_id)
+    text = (
+        ui.header("付费查询", "💎")
+        + f"\n当前积分：<b>{user['points'] if user else 0}</b>\n"
+        + f"汇率：1 USDT = {config.USDT_TO_POINTS} 积分\n"
+        + ui.divider()
+    )
+    rows = []
+    row = []
+    for key, mod in PAID_MODULES.items():
+        row.append((f"{mod['emoji']} {mod['title']} · {mod['cost']}分", f"tool:paid:{key}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([("💰 去充值", "pay:home")])
+    rows.append([("⬅️ 返回主菜单", "menu:main")])
+    return text, ui.kb(rows)
+
+
+def pay_home_panel():
+    text = (
+        ui.header("充值", "💰")
+        + "\n请选择支付方式：\n"
+        + ui.divider()
+        + f"\nUSDT-TON：链上自动到账检测，1 USDT = {config.USDT_TO_POINTS} 积分\n"
+        + "OKPay：暂不支持自动充值，请联系管理员人工处理"
+    )
+    rows = [
+        [("💠 USDT (TON)", "pay:method:usdt")],
+        [("🅾️ OKPay（联系管理员）", "pay:contact_admin")],
+        [("⬅️ 返回主菜单", "menu:main")],
+    ]
+    return text, ui.kb(rows)
+
+
+def pay_contact_admin_panel():
+    text = (
+        ui.header("OKPay 充值", "🅾️")
+        + "\n\nOKPay 自动充值功能暂不可用。\n"
+        + f"如需使用 OKPay 充值，请点击下方按钮联系管理员 @{ADMIN_CONTACT_USERNAME}。"
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("💬 联系管理员", url=ADMIN_CONTACT_URL))
+    markup.add(types.InlineKeyboardButton("⬅️ 返回", callback_data="pay:home"))
+    return text, markup
+
+
+def invite_home_panel(user_id):
+    user = db.get_or_create_user(user_id, None)
+    count = db.get_invite_count(user_id)
+    link = f"https://t.me/{BOT_USERNAME}?start={user['invite_code']}" if BOT_USERNAME else "(需先设置机器人用户名)"
+    text = (
+        ui.header("邀请好友", "🎁")
+        + f"\n\n你的邀请码：<code>{user['invite_code']}</code>\n"
+        + f"专属邀请链接：\n{link}\n\n"
+        + f"已邀请人数：{count}\n"
+        + (f"每邀请 1 人奖励 {config.INVITE_REWARD_POINTS} 积分" if config.INVITE_REWARD_POINTS else "当前邀请暂无积分奖励")
+    )
+    rows = [[("⬅️ 返回主菜单", "menu:main")]]
+    return text, ui.kb(rows)
+
+
+# ---------------------------------------------------------
+# /start（唯一的斜杠命令）
+# ---------------------------------------------------------
+
+@bot.message_handler(commands=["start"])
+def start_cmd(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    invite_code_used = None
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2:
+        invite_code_used = parts[1].strip()
+
+    db.get_or_create_user(user_id, message.from_user.username, invite_code_used)
+    if blocked(user_id, chat_id):
+        return
+
+    WAITING.pop(user_id, None)
+    text, markup = main_menu_panel(user_id)
+    sent = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    PANEL[user_id] = {"chat_id": chat_id, "message_id": sent.message_id}
+
+
+# ---------------------------------------------------------
+# 回调总入口
+# ---------------------------------------------------------
+
+@bot.callback_query_handler(func=lambda c: True)
+def on_callback(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    PANEL[user_id] = {"chat_id": chat_id, "message_id": call.message.message_id}
+
+    if blocked(user_id, chat_id):
+        bot.answer_callback_query(call.id)
+        return
+
+    data = call.data
+    try:
+        if data == "menu:main":
+            WAITING.pop(user_id, None)
+            text, markup = main_menu_panel(user_id)
+            _show(chat_id, user_id, text, markup)
+
+        elif data == "free:home":
+            text, markup = free_home_panel()
+            _show(chat_id, user_id, text, markup)
+
+        elif data == "paid:home":
+            text, markup = paid_home_panel(user_id)
+            _show(chat_id, user_id, text, markup)
+
+        elif data == "pay:home":
+            text, markup = pay_home_panel()
+            _show(chat_id, user_id, text, markup)
+
+        elif data == "pay:contact_admin":
+            text, markup = pay_contact_admin_panel()
+            _show(chat_id, user_id, text, markup)
+
+        elif data == "invite:home":
+            text, markup = invite_home_panel(user_id)
+            _show(chat_id, user_id, text, markup)
+
+        elif data.startswith("tool:"):
+            _, tier, key = data.split(":", 2)
+            _open_tool(user_id, chat_id, tier, key)
+
+        elif data.startswith("pay:method:"):
+            _open_pay_amount(user_id, chat_id, data.split(":")[-1])
+
+        elif data.startswith("pay:check:"):
+            _check_usdt(user_id, chat_id, data.split(":", 2)[2])
+
+        elif data.startswith("pay:cancel:"):
+            _cancel_order(user_id, chat_id, data.split(":", 2)[2])
+
+        elif data == "admin:home" and is_admin(user_id):
+            text, markup = _admin_home_panel()
+            _show(chat_id, user_id, text, markup)
+
+        elif data.startswith("admin:") and is_admin(user_id):
+            _handle_admin_callback(user_id, chat_id, data)
+
+        else:
+            bot.answer_callback_query(call.id, "无权限或未知操作", show_alert=True)
+            return
+
+        bot.answer_callback_query(call.id)
+
+    except Exception as e:
+        logger.exception("回调处理失败")
+        bot.answer_callback_query(call.id, f"出错了：{e}", show_alert=True)
+
+
+# ---------------------------------------------------------
+# 工具调用：免费/付费共用一套流程，区别只在是否检查+扣积分
+# ---------------------------------------------------------
+
+def _open_tool(user_id, chat_id, tier, key):
+    mod = get_module(tier, key)
+    if not mod:
+        bot.send_message(chat_id, "❌ 工具不存在。")
+        return
+
+    if tier == "paid" and mod["cost"]:
+        user = db.get_user(user_id)
+        if not user or user["points"] < mod["cost"]:
+            text = ui.header("积分不足", "⚠️") + f"\n\n该工具需要 {mod['cost']} 积分，你当前积分不足。"
+            _show(chat_id, user_id, text, ui.kb([[("💰 去充值", "pay:home")], [("⬅️ 返回", "paid:home")]]))
+            return
+
+    WAITING[user_id] = {"type": "tool", "tier": tier, "key": key}
+    back_target = "paid:home" if tier == "paid" else "free:home"
+    text = ui.header(mod["title"], mod["emoji"]) + f"\n\n{mod['prompt']}"
+    _show(chat_id, user_id, text, ui.kb([[("❌ 取消", back_target)]]))
+
+
+def _run_tool_with_input(user_id, chat_id, tier, key, user_text):
+    mod = get_module(tier, key)
+    WAITING.pop(user_id, None)
+    if not mod:
+        return
+
+    if tier == "paid" and mod["cost"]:
+        user = db.get_user(user_id)
+        if not user or user["points"] < mod["cost"]:
+            text = ui.header("积分不足", "⚠️")
+            _show(chat_id, user_id, text, ui.kb([[("💰 去充值", "pay:home")], [("⬅️ 返回", "paid:home")]]))
+            return
+
+    result = mod["run"](user_text)
+
+    if tier == "paid" and mod["cost"]:
+        db.add_points(user_id, -mod["cost"], f"使用付费工具:{key}")
+        log_action(user_id, "paid_tool", key, -mod["cost"])
+    else:
+        log_action(user_id, "free_tool", key, 0)
+
+    text = ui.header(mod["title"], mod["emoji"]) + f"\n\n{result}"
+    back_target = "paid:home" if tier == "paid" else "free:home"
+    rows = [[("🔁 再用一次", f"tool:{tier}:{key}")], [("⬅️ 返回", back_target), ("🏠 主菜单", "menu:main")]]
+    _show(chat_id, user_id, text, ui.kb(rows))
+
+
+# ---------------------------------------------------------
+# 支付流程（当前只支持 USDT；OKPay 已改为引导联系管理员，见 pay_contact_admin_panel）
+# ---------------------------------------------------------
+
+def _open_pay_amount(user_id, chat_id, method):
+    WAITING[user_id] = {"type": "pay_amount", "method": method}
+    label = "USDT" if method == "usdt" else method
+    text = ui.header(f"{label} 充值", "💰") + f"\n\n请输入充值金额（数字），最低 {config.MIN_ORDER_AMOUNT}："
+    _show(chat_id, user_id, text, ui.kb([[("❌ 取消", "pay:home")]]))
+
+
+def _create_order_with_amount(user_id, chat_id, method, amount_text):
+    WAITING.pop(user_id, None)
+    try:
+        amount = float(amount_text.strip())
+    except ValueError:
+        text = ui.header("金额无效", "⚠️") + "\n\n请输入数字金额。"
+        _show(chat_id, user_id, text, ui.kb([[("⬅️ 返回", "pay:home")]]))
+        return
+
+    try:
+        # 目前充值只走 USDT 自动到账；OKPay 入口已在 pay_home_panel 里
+        # 改成"联系管理员"，正常流程不会带 method="okpay" 走到这里。
+        order_id, address = payment.create_usdt_order(user_id, amount)
+        expect_points = int(amount * config.USDT_TO_POINTS)
+        text = (
+            ui.header("USDT 订单已创建", "💠")
+            + f"\n\n订单号：<code>{order_id}</code>\n"
+            + f"金额：{amount} USDT（预计到账 {expect_points} 积分）\n"
+            + f"收款地址：\n<code>{address}</code>\n\n"
+            + f"转账完成后点击下方按钮检查到账，"
+            + f"系统也会每 {config.AUTO_SCAN_INTERVAL_SECONDS} 秒自动扫描一次。"
+        )
+        rows = [
+            [("🔍 检查到账", f"pay:check:{order_id}")],
+            [("🚫 取消订单", f"pay:cancel:{order_id}")],
+            [("🏠 主菜单", "menu:main")],
+        ]
+        _show(chat_id, user_id, text, ui.kb(rows))
+
+    except (ValueError, RuntimeError) as e:
+        text = ui.header("下单失败", "⚠️") + f"\n\n{e}"
+        _show(chat_id, user_id, text, ui.kb([[("⬅️ 返回", "pay:home")]]))
+
+
+def _check_usdt(user_id, chat_id, order_id):
+    result = payment.check_usdt_payment(order_id)
+
+    if result.get("confirmed"):
+        user = db.get_user(user_id)
+        text = (
+            ui.header("充值成功", "✅")
+            + f"\n\n到账金额：{result['amount']} USDT\n"
+            + f"获得积分：{result.get('points_credit', '')}\n"
+            + f"当前积分：{user['points'] if user else '-'}"
+        )
+        _show(chat_id, user_id, text, ui.kb([[("🏠 返回主菜单", "menu:main")]]))
+        return
+
+    if not result.get("success"):
+        text = (
+            ui.header("检查到账失败", "❌")
+            + f"\n\n{result.get('message', '暂未查询到到账记录。')}\n\n"
+            + "可以稍后重试，或选择关闭订单。"
+        )
+        rows = [
+            [("🔍 重新检查", f"pay:check:{order_id}"), ("🚫 关闭订单", f"pay:cancel:{order_id}")],
+            [("🏠 主菜单", "menu:main")],
+        ]
+        _show(chat_id, user_id, text, ui.kb(rows))
+        return
+
+    text = ui.header("暂未到账", "⏳") + "\n\n还没有查询到符合条件的转账，请确认转账已完成后再试一次。"
+    rows = [
+        [("🔍 重新检查", f"pay:check:{order_id}"), ("🚫 取消订单", f"pay:cancel:{order_id}")],
+        [("🏠 主菜单", "menu:main")],
+    ]
+    _show(chat_id, user_id, text, ui.kb(rows))
+
+
+def _cancel_order(user_id, chat_id, order_id):
+    payment.cancel_order(order_id)
+    text = ui.header("订单已关闭", "🚫") + f"\n\n订单号：<code>{order_id}</code>"
+    _show(chat_id, user_id, text, ui.kb([[("🏠 返回主菜单", "menu:main")]]))
+
+
+# ---------------------------------------------------------
+# 管理面板：用户列表(加/扣积分、封禁/解封)、地址池、广播
+# ---------------------------------------------------------
+
+def _admin_home_panel():
+    text = ui.header("管理面板", "🛠") + f"\n\n注册用户数：{db.count_users()}"
+    rows = [
+        [("👥 用户列表", "admin:users:0")],
+        [("💳 收款地址池", "admin:addr:list")],
+        [("📢 广播消息", "admin:broadcast")],
+        [("⬅️ 返回主菜单", "menu:main")],
+    ]
+    return text, ui.kb(rows)
+
+
+def _admin_users_panel(offset):
+    users = db.list_users(limit=8, offset=offset)
+    text = ui.header("用户列表", "👥") + "\n"
+    rows = []
+    for u in users:
+        tag = "🚫" if u["banned"] else "✅"
+        rows.append([(f"{tag} {u['user_id']} · {u['points']}分", f"admin:user:{u['user_id']}")])
+    nav = []
+    if offset > 0:
+        nav.append(("⬅️ 上一页", f"admin:users:{max(0, offset-8)}"))
+    if len(users) == 8:
+        nav.append(("下一页 ➡️", f"admin:users:{offset+8}"))
+    if nav:
+        rows.append(nav)
+    rows.append([("⬅️ 返回管理面板", "admin:home")])
+    return text, ui.kb(rows)
+
+
+def _admin_user_detail_panel(target_id):
+    user = db.get_user(target_id)
+    if not user:
+        return ui.header("用户不存在", "⚠️"), ui.kb([[("⬅️ 返回", "admin:users:0")]])
+    status = "🚫 已封禁" if user["banned"] else "✅ 正常"
+    invite_count = db.get_invite_count(target_id)
+    text = (
+        ui.header(f"用户 {target_id}", "👤")
+        + f"\n\n状态：{status}\n积分：{user['points']}\n"
+        + f"邀请人数：{invite_count}\n注册时间：{user['created_at']}"
+    )
+    ban_btn = ("✅ 解封", f"admin:user:{target_id}:unban") if user["banned"] else ("🚫 封禁", f"admin:user:{target_id}:ban")
+    rows = [
+        [("➕ 加积分", f"admin:user:{target_id}:addpts"), ("➖ 扣积分", f"admin:user:{target_id}:subpts")],
+        [ban_btn],
+        [("⬅️ 返回用户列表", "admin:users:0")],
+    ]
+    return text, ui.kb(rows)
+
+
+def _admin_addr_list_panel():
+    rows_data = db.list_addresses()
+    ADDR_SHORT.clear()
+    text = ui.header("收款地址池", "💳") + "\n"
+    rows = []
+    for i, row in enumerate(rows_data):
+        short = f"a{i}"
+        ADDR_SHORT[short] = row["address"]
+        status = "✅" if row["enabled"] else "🚫"
+        label = f"{status} {row['address'][:6]}...{row['address'][-4:]} · 待处理{row['pending_count']}"
+        rows.append([(label, f"admin:addr:toggle:{short}")])
+    rows.append([("➕ 添加地址", "admin:addr:add")])
+    rows.append([("⬅️ 返回管理面板", "admin:home")])
+    return text, ui.kb(rows)
+
+
+def _handle_admin_callback(user_id, chat_id, data):
+    parts = data.split(":")
+
+    if parts[1] == "users":
+        offset = int(parts[2])
+        text, markup = _admin_users_panel(offset)
+        _show(chat_id, user_id, text, markup)
+        return
+
+    if parts[1] == "user":
+        target_id = int(parts[2])
+        if len(parts) == 3:
+            text, markup = _admin_user_detail_panel(target_id)
+            _show(chat_id, user_id, text, markup)
+            return
+        action = parts[3]
+        if action == "ban":
+            db.set_ban(target_id, True, "管理员封禁")
+        elif action == "unban":
+            db.set_ban(target_id, False, "")
+        elif action in ("addpts", "subpts"):
+            WAITING[user_id] = {"type": "admin_points", "target": target_id, "sign": 1 if action == "addpts" else -1}
+            text = ui.header("修改积分", "✏️") + f"\n\n请输入{'增加' if action=='addpts' else '扣除'}的积分数（正整数）："
+            _show(chat_id, user_id, text, ui.kb([[("❌ 取消", f"admin:user:{target_id}")]]))
+            return
+        text, markup = _admin_user_detail_panel(target_id)
+        _show(chat_id, user_id, text, markup)
+        return
+
+    if parts[1] == "addr":
+        if parts[2] == "list":
+            text, markup = _admin_addr_list_panel()
+            _show(chat_id, user_id, text, markup)
+            return
+        if parts[2] == "add":
+            WAITING[user_id] = {"type": "admin_add_addr"}
+            text = ui.header("添加收款地址", "➕") + "\n\n请输入 USDT-TON 收款地址："
+            _show(chat_id, user_id, text, ui.kb([[("❌ 取消", "admin:addr:list")]]))
+            return
+        if parts[2] == "toggle":
+            address = ADDR_SHORT.get(parts[3])
+            if address:
+                current = next((r for r in db.list_addresses() if r["address"] == address), None)
+                if current and current["enabled"]:
+                    db.remove_address(address)
+                else:
+                    db.add_address(address)
+            text, markup = _admin_addr_list_panel()
+            _show(chat_id, user_id, text, markup)
+            return
+
+    if parts[1] == "broadcast":
+        WAITING[user_id] = {"type": "admin_broadcast"}
+        text = ui.header("广播消息", "📢") + "\n\n请输入要发送给所有用户的文本："
+        _show(chat_id, user_id, text, ui.kb([[("❌ 取消", "admin:home")]]))
+        return
+
+
+def _run_broadcast(admin_id, chat_id, text_to_send):
+    user_ids = db.list_all_user_ids()
+    total = len(user_ids)
+
+    def worker():
+        sent, failed = 0, 0
+        for uid in user_ids:
+            try:
+                bot.send_message(uid, f"📢 {text_to_send}")
+                sent += 1
+            except Exception:
+                failed += 1
+            time.sleep(config.BROADCAST_INTERVAL_SECONDS)
+        try:
+            bot.send_message(chat_id, f"✅ 广播完成：共{total}人，成功{sent}，失败{failed}。")
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+    text = ui.header("广播已开始", "📢") + f"\n\n正在向 {total} 位用户发送，完成后会单独通知你。"
+    _show(chat_id, admin_id, text, ui.kb([[("⬅️ 返回管理面板", "admin:home")]]))
+
+
+# ---------------------------------------------------------
+# 文本输入总入口
+# ---------------------------------------------------------
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def on_text(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    db.get_or_create_user(user_id, message.from_user.username)
+    if blocked(user_id, chat_id):
+        return
+
+    state = WAITING.get(user_id)
+
+    if not state:
+        text, markup = main_menu_panel(user_id)
+        if user_id in PANEL:
+            _show(chat_id, user_id, text, markup)
+        else:
+            sent = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+            PANEL[user_id] = {"chat_id": chat_id, "message_id": sent.message_id}
+        return
+
+    user_text = message.text.strip()
+
+    if state["type"] == "tool":
+        _run_tool_with_input(user_id, chat_id, state["tier"], state["key"], user_text)
+
+    elif state["type"] == "pay_amount":
+        _create_order_with_amount(user_id, chat_id, state["method"], user_text)
+
+    elif state["type"] == "admin_points" and is_admin(user_id):
+        WAITING.pop(user_id, None)
+        try:
+            amount = int(user_text)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            bot.send_message(chat_id, "❌ 请输入正整数。")
+            return
+        target = state["target"]
+        db.add_points(target, amount * state["sign"], "管理员调整")
+        log_action(user_id, "admin_points", f"target={target}", amount * state["sign"])
+        text, markup = _admin_user_detail_panel(target)
+        _show(chat_id, user_id, text, markup)
+
+    elif state["type"] == "admin_add_addr" and is_admin(user_id):
+        WAITING.pop(user_id, None)
+        db.add_address(user_text)
+        text, markup = _admin_addr_list_panel()
+        _show(chat_id, user_id, text, markup)
+
+    elif state["type"] == "admin_broadcast" and is_admin(user_id):
+        WAITING.pop(user_id, None)
+        _run_broadcast(user_id, chat_id, message.text)
+
+    else:
+        WAITING.pop(user_id, None)
+
+
+# ---------------------------------------------------------
+# 后台：USDT 自动扫描到账
+# ---------------------------------------------------------
+
+def auto_scan_loop():
+    while True:
+        try:
+            result = payment.auto_scan_pending()
+            for confirmed in result.get("confirmed", []):
+                try:
+                    bot.send_message(
+                        confirmed["user_id"],
+                        "✅ 充值自动到账成功！\n\n"
+                        f"订单：<code>{confirmed['order_id']}</code>\n"
+                        f"到账：{confirmed['amount']} USDT\n"
+                        f"获得积分：{confirmed['points_credit']}",
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    logger.warning(f"通知用户到账失败：{confirmed['user_id']} {e}")
+        except Exception as e:
+            logger.warning(f"自动扫描到账失败：{e}")
+        time.sleep(config.AUTO_SCAN_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------
+# 启动
+# ---------------------------------------------------------
+
+if __name__ == "__main__":
+    logger.info("================================")
+    logger.info("机器人启动")
+    logger.info(f"管理员数量：{len(config.ADMIN_IDS)}")
+    logger.info(f"免费模块：{list(FREE_MODULES.keys())}")
+    logger.info(f"付费模块：{list(PAID_MODULES.keys())}")
+    logger.info("================================")
+
+    threading.Thread(target=auto_scan_loop, daemon=True).start()
+    # timeout/long_polling_timeout 调短一些，代理不稳时能更快感知并重连，
+    # 而不是长时间卡在一次长轮询请求里。infinity_polling 本身自带断线重试。
+    bot.infinity_polling(skip_pending=True, timeout=10, long_polling_timeout=10)
