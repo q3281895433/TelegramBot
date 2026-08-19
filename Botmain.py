@@ -157,11 +157,11 @@ def pay_home_panel():
         ui.header("充值", "💰")
         + "\n请选择支付方式：\n"
         + ui.divider()
-        + f"\nUSDT-TON：链上自动到账检测，1 USDT = {config.USDT_TO_POINTS} 积分\n"
+        + f"\nUSDT-TRC20（波场链）：链上自动到账检测，1 USDT = {config.USDT_TO_POINTS} 积分\n"
         + "OKPay：暂不支持自动充值，请联系管理员人工处理"
     )
     rows = [
-        [("💠 USDT (TON)", "pay:method:usdt")],
+        [("💠 USDT (TRC20)", "pay:method:usdt")],
         [("🅾️ OKPay（联系管理员）", "pay:contact_admin")],
         [("⬅️ 返回主菜单", "menu:main")],
     ]
@@ -370,6 +370,7 @@ def _create_order_with_amount(user_id, chat_id, method, amount_text):
             ui.header("USDT 订单已创建", "💠")
             + f"\n\n订单号：<code>{order_id}</code>\n"
             + f"金额：{amount} USDT（预计到账 {expect_points} 积分）\n"
+            + "⚠️ 请务必使用 <b>TRC20（波场链）</b> 转账，其他链（如 ERC20/TON）转账将无法到账。\n"
             + f"收款地址：\n<code>{address}</code>\n\n"
             + f"转账完成后点击下方按钮检查到账，"
             + f"系统也会每 {config.AUTO_SCAN_INTERVAL_SECONDS} 秒自动扫描一次。"
@@ -532,7 +533,7 @@ def _handle_admin_callback(user_id, chat_id, data):
             return
         if parts[2] == "add":
             WAITING[user_id] = {"type": "admin_add_addr"}
-            text = ui.header("添加收款地址", "➕") + "\n\n请输入 USDT-TON 收款地址："
+            text = ui.header("添加收款地址", "➕") + "\n\n请输入 USDT-TRC20（波场链）收款地址（T 开头）："
             _show(chat_id, user_id, text, ui.kb([[("❌ 取消", "admin:addr:list")]]))
             return
         if parts[2] == "toggle":
